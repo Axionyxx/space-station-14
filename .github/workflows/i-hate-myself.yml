@@ -1,0 +1,157 @@
+name: Map Render
+on:
+  pull_request:
+    types: [ opened, reopened, synchronize, ready_for_review ]
+    branches: [ master, masterbutcooler ]
+    paths:
+      - 'Resources/Maps/**'
+  workflow_run:
+    workflows: [ "Map Render" ]
+    types: [ completed ]
+permissions: {}
+
+jobs:
+  render:
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 45 # God I hope not
+    permissions:
+      contents: read
+    concurrency:
+      group: map-render-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout PR merged into base
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false # Fuck you and your token, no leaks today
+
+      - name: Setup Submodule
+        run: git submodule update --init --recursive
+
+      - name: Pull engine updates
+        uses: space-wizards/submodule-dependency@v0.1.5
+
+      - name: Update Engine Submodules
+        run: |
+          cd RobustToolbox/
+          git submodule update --init --recursive
+
+      - name: Setup .NET Core
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build map renderer
+        run: dotnet build Content.MapRenderer --configuration Release /m
+
+      - name: Render changed maps
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          mkdir -p out/images
+          echo "$PR_NUMBER" > out/pr_number
+
+          mapfile -t MAPS < <(git diff --name-only --no-renames --diff-filter=AM HEAD^1 HEAD -- 'Resources/Maps/*.yml' | head -n 5)
+          if [ "${#MAPS[@]}" -gt 0 ]; then
+            dotnet run --project Content.MapRenderer --configuration Release --no-build -- \
+              -f --format webp -o "$PWD/out/images" "${MAPS[@]}"
+          fi
+
+      - name: Shrink oversized images
+        run: |
+          while IFS= read -r -d '' f; do
+            magick "$f" -define webp:lossless=false -quality 90 "$f" || continue
+            for _ in 1 2 3 4 5 6; do
+              [ "$(stat -c %s "$f")" -le 9000000 ] && break
+              magick "$f" -resize 75% "$f" || break
+            done
+            echo "$f: $(stat -c %s "$f") bytes"
+          done < <(find out/images -type f -name '*.webp' -size +9000000c -print0)
+
+      - name: Upload render artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: map-render
+          path: out/
+          retention-days: 3
+
+  comment:
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      pull-requests: write
+    env:
+      GH_VERSION: 2.102.0 # I don't trust github to have its cli up to date in the runner :/
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Download render artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: map-render
+          path: artifact
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Install GitHub CLI
+        run: |
+          curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" | tar -xz
+          sudo install "gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh
+
+      - name: Post comment 
+        env:
+          RENDER_RESULT: ${{ github.event.workflow_run.conclusion }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: | # Lord forgive me, for I have sinned
+          set -euo pipefail
+          cd artifact
+
+          pr=$(cat pr_number)
+          [[ "$pr" =~ ^[0-9]+$ ]] || { echo "Invalid PR number"; exit 1; }
+
+          mapfile -t all < <(find images -type f -name '*.webp' | grep -E '^images/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\.webp$' | sort | head -n 50)
+          images=(); toolarge=()
+          for f in "${all[@]}"; do
+            if [ "$(stat -c %s "$f")" -lt 10000000 ]; then images+=("$f"); else toolarge+=("$(basename "$f")"); fi
+          done
+
+          if [ "${#all[@]}" -eq 0 ] && [ "$RENDER_RESULT" = success ]; then
+            exit 0
+          fi
+
+          {
+            echo "<!-- map-render -->"
+            echo "## Map render"
+            if [ "${#all[@]}" -eq 0 ]; then
+              echo
+              echo "Rendering failed. [Workflow run]($RUN_URL)"
+            fi
+            prev=""
+            for f in "${images[@]}"; do
+              map=$(basename "$(dirname "$f")")
+              if [ "$map" != "$prev" ]; then
+                if [ -n "$prev" ]; then echo "</details>"; fi
+                printf '\n<details><summary>%s</summary>\n\n' "$map"
+                prev=$map
+              fi
+              printf '![%s](%s)\n\n' "$(basename "$f")" "$f"
+            done
+            if [ -n "$prev" ]; then echo "</details>"; fi
+            if [ "${#toolarge[@]}" -gt 0 ]; then
+              printf '\nToo large to attach even after shrinking: %s\n' "${toolarge[*]}"
+            fi
+          } > ../comment.md
+
+          gh api "repos/$REPO/issues/$pr/comments" --paginate \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("<!-- map-render -->"))) | .id' \
+            | while read -r id; do gh api -X DELETE "repos/$REPO/issues/comments/$id"; done
+
+          attach=()
+          for f in "${images[@]}"; do attach+=(--attach "$f"); done
+          gh pr comment "$pr" --repo "$REPO" --body-file ../comment.md "${attach[@]}"
